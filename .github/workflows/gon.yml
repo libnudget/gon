@@ -1,0 +1,185 @@
+name: gon
+
+# A calm workflow that gently analyzes Dependabot pull requests
+# and provides a clear summary to support confident merges.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to analyze'
+        required: false
+        type: string
+
+jobs:
+  analyze-dependabot-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      # ------------------------------------------------------------
+      # Determine whether the workflow should run
+      # ------------------------------------------------------------
+      - name: Determine if should run
+        id: should-run
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] &&
+             [ -n "${{ github.event.inputs.pr_number }}" ]; then
+            echo "RUN=true" >> $GITHUB_OUTPUT
+            echo "PR_NUMBER=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            echo "TRIGGER_USER=${{ github.actor }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            COMMENT_BODY="${{ github.event.comment.body }}"
+            if echo "$COMMENT_BODY" | grep -qiE "^\/(analyze|run analysis|check pr)"; then
+              echo "RUN=true" >> $GITHUB_OUTPUT
+              echo "PR_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+              echo "TRIGGER_USER=${{ github.event.comment.user.login }}" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "RUN=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "${{ github.actor }}" = "dependabot[bot]" ]; then
+            echo "RUN=true" >> $GITHUB_OUTPUT
+            echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "TRIGGER_USER=dependabot[bot]" >> $GITHUB_OUTPUT
+          else
+            echo "RUN=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ------------------------------------------------------------
+      # Fetch changed files using GitHub API
+      # ------------------------------------------------------------
+      - name: Get changed files
+        if: steps.should-run.outputs.RUN == 'true'
+        id: changed-files
+        run: |
+          PR_NUM="${{ steps.should-run.outputs.PR_NUMBER }}"
+
+          PR_DATA=$(curl -s -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM")
+
+          echo "PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')" >> $GITHUB_OUTPUT
+          echo "PR_USER=$(echo "$PR_DATA" | jq -r '.user.login')" >> $GITHUB_OUTPUT
+
+          FILES_JSON=$(curl -s -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/$PR_NUM/files?per_page=100")
+
+          FILES=$(echo "$FILES_JSON" | jq -r '.[].filename')
+          echo "Changed files: $FILES" >> $GITHUB_STEP_SUMMARY
+
+          DEP_PATTERNS="requirements|setup.py|pyproject.toml|Pipfile|package.json|yarn.lock|pnpm-lock.yaml|Cargo.toml|go.mod|go.sum|composer.json|pom.xml|\\.csproj$|Gemfile"
+
+          DEP_FILES=""
+          for file in $FILES; do
+            if echo "$file" | grep -qiE "$DEP_PATTERNS"; then
+              DEP_FILES="$DEP_FILES $file"
+            fi
+          done
+
+          echo "CHANGED_FILES=$DEP_FILES" >> $GITHUB_OUTPUT
+
+          for file in $DEP_FILES; do
+            PATCH=$(echo "$FILES_JSON" | jq -r ".[] | select(.filename==\"$file\") | .patch")
+            if [ -n "$PATCH" ] && [ "$PATCH" != "null" ]; then
+              SAFE=$(echo "$file" | tr '/.-' '___')
+              echo "DIFF_$SAFE=$(echo "$PATCH" | base64 -w 0)" >> $GITHUB_OUTPUT
+            fi
+          done
+
+      # ------------------------------------------------------------
+      # Analyze dependency impact
+      # ------------------------------------------------------------
+      - name: Analyze changes
+        if: steps.should-run.outputs.RUN == 'true'
+        id: analysis
+        run: |
+          PR_TITLE="${{ steps.changed-files.outputs.PR_TITLE }}"
+          CHANGED="${{ steps.changed-files.outputs.CHANGED_FILES }}"
+
+          if [ -z "$CHANGED" ]; then
+            echo "impact=low" >> $GITHUB_OUTPUT
+            echo "status=No dependency files were modified." >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "impact=medium" >> $GITHUB_OUTPUT
+
+          if echo "$PR_TITLE" | grep -qi "security"; then
+            echo "status=Security-related update. Review calmly before merging." >> $GITHUB_OUTPUT
+          elif echo "$PR_TITLE" | grep -qiE "(major|breaking)"; then
+            echo "impact=high" >> $GITHUB_OUTPUT
+            echo "status=Major update detected. Testing is recommended." >> $GITHUB_OUTPUT
+          elif echo "$PR_TITLE" | grep -qiE "(minor|patch|chore|deps|fix)"; then
+            echo "impact=low" >> $GITHUB_OUTPUT
+            echo "status=Minor update. Usually safe to merge." >> $GITHUB_OUTPUT
+          else
+            echo "status=Review the dependency changes before merging." >> $GITHUB_OUTPUT
+          fi
+
+      # ------------------------------------------------------------
+      # Post a calm summary comment
+      # ------------------------------------------------------------
+      - name: Post summary comment
+        if: steps.should-run.outputs.RUN == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const impact = '${{ steps.analysis.outputs.impact }}';
+            const status = '${{ steps.analysis.outputs.status }}';
+            const files = '${{ steps.changed-files.outputs.CHANGED_FILES }}';
+            const pr = Number('${{ steps.should-run.outputs.PR_NUMBER }}');
+            const user = '${{ steps.should-run.outputs.TRIGGER_USER }}';
+
+            const symbol = impact === 'high' ? '⚠️' : impact === 'medium' ? '◻️' : '✓';
+
+            const body =
+              `Hi @${user},\n\n` +
+              `I took a calm look at this Dependabot pull request.\n\n` +
+              `## gon ${symbol}\n\n` +
+              `${status}\n\n` +
+              `**Changed files:** ${files || 'None'}\n\n` +
+              `---\n` +
+              `_Reviewed quietly by gon_`;
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+            });
+
+            const existing = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes('_Reviewed quietly by gon_')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                body,
+              });
+            }
+
+      - name: Skip
+        if: steps.should-run.outputs.RUN != 'true'
+        run: echo "gon stayed quiet."
