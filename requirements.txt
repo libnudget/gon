@@ -1,0 +1,3 @@
+# Dummy test file to simulate dependency update
+
+pytest==8.0.0
