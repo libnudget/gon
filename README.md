@@ -1,5 +1,7 @@
 # gon
 
+[![Release](https://img.shields.io/github/v/release/libnudget/gon?logo=github&label=latest)](https://github.com/libnudget/gon/releases)
+
 A calm GitHub Actions workflow that gently reviews Dependabot pull requests and provides clear summaries to help you merge confidently.
 
 gon stays quiet, helpful, and unobtrusive.
