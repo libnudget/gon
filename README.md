@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Coccinella-Labs/gon/main/.github/assets/thumbnail.png" alt="gon" width="100%">
+</p>
+
 # gon
 
 [![Release](https://img.shields.io/github/v/release/libnudget/gon?logo=github&label=latest)](https://github.com/libnudget/gon/releases)
